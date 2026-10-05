@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>사이버 펭귄 러너 — 삐야 &amp; 오르</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      overflow: hidden;
+      background: #050510;
+      font-family: "Segoe UI", "Malgun Gothic", sans-serif;
+      color: #e8f4ff;
+    }
+    #wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      padding: 8px;
+    }
+    canvas {
+      display: block;
+      max-width: 100%;
+      max-height: calc(100vh - 16px);
+      border: 2px solid #00f0ff44;
+      border-radius: 8px;
+      box-shadow: 0 0 40px #00f0ff22, inset 0 0 60px #000;
+    }
+    .hint {
+      margin-top: 8px;
+      font-size: 12px;
+      color: #6a8aaa;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="480" height="720" aria-label="사이버 펭귄 러너"></canvas>
+    <p class="hint">← → 또는 A D · 터치: 화면 좌/우 · 화면 클릭 시 사운드 ON</p>
+  </div>
+  <script>
+(function () {
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  const W = canvas.width;
+  const H = canvas.height;
+  const HORIZON_Y = H * 0.32;
+  const PLAYER_Z = 0.88;
+
+  const HS_KEY = "cyberPenguinRunner_highScore";
+
+  const AUDIO_FILES = {
+    menuBgm: "audio/menu_bgm.ogg",
+    gameBgm: "audio/game_bgm.ogg",
+    overBgm: "audio/game_over_bgm.ogg",
+    hit: "audio/hit.ogg",
+    heal: "audio/heal.ogg",
+  };
+
+  const AudioSys = (function createAudio() {
+    const menu = new Audio(AUDIO_FILES.menuBgm);
+    const game = new Audio(AUDIO_FILES.gameBgm);
+    const over = new Audio(AUDIO_FILES.overBgm);
+    menu.loop = true;
+    game.loop = true;
+    over.loop = true;
+    menu.volume = 0.38;
+    game.volume = 0.42;
+    over.volume = 0.45;
+    let unlocked = false;
+    let currentBgm = null;
+
+    function stopBgm() {
+      [menu, game, over].forEach((a) => {
+        a.pause();
+        a.currentTime = 0;
+      });
+      currentBgm = null;
+    }
+
+    function playBgm(track) {
+      if (!unlocked || currentBgm === track) return;
+      stopBgm();
+      currentBgm = track;
+      track.currentTime = 0;
+      track.play().catch(() => {});
+    }
+
+    function unlock() {
+      if (unlocked) return;
+      unlocked = true;
+    }
+
+    function syncForState(gameState, STATE_REF) {
+      if (!unlocked) return;
+      if (gameState === STATE_REF.SELECT) playBgm(menu);
+      else if (gameState === STATE_REF.PLAY) playBgm(game);
+      else if (gameState === STATE_REF.OVER) playBgm(over);
+    }
+
+    function sfx(file, volume) {
+      if (!unlocked) return;
+      const a = new Audio(file);
+      a.volume = volume ?? 0.55;
+      a.play().catch(() => {});
+    }
+
+    return {
+      unlock,
+      syncForState,
+      playHit: () => sfx(AUDIO_FILES.hit, 0.62),
+      playHeal: () => sfx(AUDIO_FILES.heal, 0.58),
+    };
+  })();
+
+  function tryUnlockAudio() {
+    AudioSys.unlock();
+    AudioSys.syncForState(state, STATE);
+  }
+
+  const MOTION = {
+    RUN: "run",
+    TURN_L: "turnL",
+    TURN_R: "turnR",
+    HEAL: "heal",
+    HIT: "hit",
+  };
+  const MOTION_PRIORITY = { run: 0, turn: 1, heal: 2, hit: 3 };
+
+  const CHARACTERS = {
+    bbiya: {
+      id: "bbiya",
+      name: "삐야",
+      tagline: "빙하를 찾는 사이버 탐험가",
+      accent: "#ff6ec7",
+      glow: "#00f0ff",
+      front: "삐야-정면.png",
+      motions: {
+        run: "삐야_run.png",
+        turnR: "삐야_turn_r.png",
+        heal: "삐야_heal.png",
+        hit: "삐야_hit.png",
+      },
+      runAlt: null,
+      turnLMirror: true,
+    },
+    oru: {
+      id: "oru",
+      name: "오르",
+      tagline: "네온 길을 가르는 전설의 펭귄",
+      accent: "#ffb347",
+      glow: "#7b68ee",
+      front: "오르-정면.png",
+      motions: {
+        run: "오르_run.png",
+        turnR: "오르_turn_r.png",
+        heal: "오르_heal.png",
+        hit: "오르_hit.png",
+      },
+      runAlt: "오르_turn_r.png",
+      turnLMirror: false,
+    },
+  };
+
+  const spriteCache = {};
+  let imagesReady = false;
+  let playerMotion = { type: MOTION.RUN, until: 0, priority: 0 };
+
+  function loadImage(src) {
+    if (spriteCache[src]) return spriteCache[src].promise;
+    const img = new Image();
+    const promise = new Promise((resolve, reject) => {
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error(src));
+    });
+    img.src = src;
+    spriteCache[src] = { img, promise };
+    return promise;
+  }
+
+  function collectSpritePaths() {
+    const paths = new Set();
+    Object.values(CHARACTERS).forEach((c) => {
+      paths.add(c.front);
+      Object.values(c.motions).forEach((p) => paths.add(p));
+      if (c.runAlt) paths.add(c.runAlt);
+    });
+    return [...paths];
+  }
+
+  Promise.all(collectSpritePaths().map(loadImage))
+    .then(() => { imagesReady = true; })
+    .catch((err) => console.error("이미지 로드 실패:", err));
+
+  function playPlayerMotion(type, duration, priority) {
+    if (priority < playerMotion.priority && playTime < playerMotion.until) return;
+    playerMotion = { type, until: playTime + duration, priority };
+  }
+
+  function tickPlayerMotion() {
+    if (playTime >= playerMotion.until) {
+      playerMotion = { type: MOTION.RUN, until: 0, priority: 0 };
+    }
+  }
+
+  function resolvePlaySprite(charKey) {
+    const c = CHARACTERS[charKey];
+    let flipX = false;
+    let path;
+
+    const active = playTime < playerMotion.until ? playerMotion.type : MOTION.RUN;
+
+    if (active === MOTION.HIT) {
+      path = c.motions.hit;
+    } else if (active === MOTION.HEAL) {
+      path = c.motions.heal;
+    } else if (active === MOTION.TURN_L) {
+      if (c.turnLMirror) {
+        path = c.motions.turnR;
+        flipX = true;
+      } else {
+        path = c.motions.run;
+      }
+    } else if (active === MOTION.TURN_R) {
+      path = c.motions.turnR;
+    } else if (c.runAlt && Math.floor(playTime * 7) % 2 === 1) {
+      path = c.runAlt;
+    } else {
+      path = c.motions.run;
+    }
+
+    const entry = spriteCache[path];
+    return { img: entry ? entry.img : null, flipX };
+  }
+
+  const STATE = { SELECT: "select", PLAY: "play", OVER: "over" };
+
+  let state = STATE.SELECT;
+  let selectedChar = "bbiya";
+  let lane = 1;
+  let lives = 5;
+  let score = 0;
+  let playTime = 0;
+  let invincibleUntil = 0;
+  let entities = [];
+  let spawnTimer = 0;
+  let gridOffset = 0;
+  let buttons = [];
+  let pointer = { x: 0, y: 0 };
+  let highScore = Number(localStorage.getItem(HS_KEY) || 0);
+  let newRecord = false;
+
+  function laneX(z, laneIndex) {
+    const t = 1 - z;
+    const center = W / 2;
+    const spreadNear = W * 0.38;
+    const spreadFar = W * 0.08;
+    const spread = spreadNear * (1 - t) + spreadFar * t;
+    const offset = (laneIndex - 1) * spread;
+    return center + offset;
+  }
+
+  function laneWidth(z) {
+    const t = 1 - z;
+    return 56 * (1 - t) + 12 * t;
+  }
+
+  function projectY(z) {
+    return HORIZON_Y + (H - HORIZON_Y - 80) * z;
+  }
+
+  function drawBackground(dt) {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#0a0018");
+    g.addColorStop(0.5, "#12082a");
+    g.addColorStop(1, "#050510");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    gridOffset = (gridOffset + dt * 0.35) % 1;
+
+    ctx.strokeStyle = "rgba(0, 240, 255, 0.15)";
+    ctx.lineWidth = 1;
+    for (let i = -8; i <= 8; i++) {
+      const x0 = W / 2 + i * 40;
+      ctx.beginPath();
+      ctx.moveTo(x0, HORIZON_Y);
+      ctx.lineTo(W / 2 + i * 120, H);
+      ctx.stroke();
+    }
+    for (let row = 0; row < 24; row++) {
+      const z = (row / 24 + gridOffset) % 1;
+      const y = projectY(z);
+      const alpha = 0.08 + z * 0.25;
+      ctx.strokeStyle = `rgba(0, 255, 200, ${alpha})`;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(W, y);
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = "rgba(255, 0, 80, 0.03)";
+    for (let i = 0; i < 30; i++) {
+      const px = (i * 97 + playTime * 20) % W;
+      const py = (i * 53 + playTime * 15) % HORIZON_Y;
+      ctx.fillRect(px, py, 2, 2);
+    }
+  }
+
+  function drawSprite(img, x, y, displayHeight, glow, alpha, flipX) {
+    if (!imagesReady || !img || !img.naturalWidth) return;
+
+    const aspect = img.naturalWidth / img.naturalHeight;
+    const h = displayHeight;
+    const w = h * aspect;
+
+    ctx.save();
+    ctx.globalAlpha = alpha ?? 1;
+    ctx.shadowColor = glow;
+    ctx.shadowBlur = 16;
+    if (flipX) {
+      ctx.translate(x, y);
+      ctx.scale(-1, 1);
+      ctx.drawImage(img, -w / 2, -h / 2, w, h);
+    } else {
+      ctx.drawImage(img, x - w / 2, y - h / 2, w, h);
+    }
+    ctx.shadowBlur = 0;
+    ctx.restore();
+  }
+
+  function drawCharacterFront(x, y, displayHeight, charKey, alpha) {
+    const c = CHARACTERS[charKey];
+    const entry = spriteCache[c.front];
+    const bob = Math.sin(performance.now() / 450) * 4;
+    drawSprite(entry?.img, x, y + bob, displayHeight, c.glow, alpha, false);
+  }
+
+  function drawCharacterPlay(x, y, displayHeight, charKey, alpha) {
+    const c = CHARACTERS[charKey];
+    const { img, flipX } = resolvePlaySprite(charKey);
+    const bob = playerMotion.type === MOTION.RUN
+      ? Math.sin(playTime * 12) * 4
+      : 0;
+    drawSprite(img, x, y + bob, displayHeight, c.glow, alpha, flipX);
+  }
+
+  function recordHighScore() {
+    const final = Math.floor(score);
+    newRecord = final > highScore;
+    if (newRecord) {
+      highScore = final;
+      localStorage.setItem(HS_KEY, String(highScore));
+    }
+  }
+
+  function drawVirus(x, y, scale) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+    const pulse = 1 + Math.sin(playTime * 8) * 0.08;
+    ctx.scale(pulse, pulse);
+    ctx.shadowColor = "#ff0044";
+    ctx.shadowBlur = 16;
+    ctx.fillStyle = "#ff2255";
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2 + playTime * 2;
+      ctx.beginPath();
+      ctx.arc(Math.cos(a) * 14, Math.sin(a) * 14, 8, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = "#aa0022";
+    ctx.beginPath();
+    ctx.arc(0, 0, 10, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawVaccine(x, y, scale) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+    ctx.shadowColor = "#00ffaa";
+    ctx.shadowBlur = 20;
+    ctx.strokeStyle = "#00ffcc";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(0, -16);
+    ctx.lineTo(0, 16);
+    ctx.moveTo(-12, 0);
+    ctx.lineTo(12, 0);
+    ctx.stroke();
+    ctx.fillStyle = "rgba(0, 255, 200, 0.4)";
+    ctx.beginPath();
+    ctx.arc(0, 0, 10, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
+    ctx.fillRect(0, 0, W, 52);
+    ctx.font = "bold 18px Segoe UI, Malgun Gothic";
+    ctx.fillStyle = "#00f0ff";
+    ctx.fillText(`SCORE ${Math.floor(score)}`, 16, 32);
+
+    const heartX = W - 16;
+    for (let i = 0; i < 5; i++) {
+      const filled = i < lives;
+      ctx.fillStyle = filled ? "#ff4466" : "#333";
+      const hx = heartX - (4 - i) * 28;
+      ctx.beginPath();
+      ctx.moveTo(hx, 28);
+      ctx.bezierCurveTo(hx - 8, 18, hx - 16, 28, hx, 36);
+      ctx.bezierCurveTo(hx + 16, 28, hx + 8, 18, hx, 28);
+      ctx.fill();
+    }
+  }
+
+  function hitRect(px, py, x, y, w, h) {
+    return px >= x && px <= x + w && py >= y && py <= y + h;
+  }
+
+  function drawButton(btn, hovered) {
+    const { x, y, w, h, label, sub } = btn;
+    ctx.fillStyle = hovered ? "rgba(0, 240, 255, 0.25)" : "rgba(0, 240, 255, 0.12)";
+    ctx.strokeStyle = hovered ? "#00f0ff" : "#00f0ff88";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 10);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 16px Segoe UI, Malgun Gothic";
+    ctx.textAlign = "center";
+    ctx.fillText(label, x + w / 2, y + h / 2 + (sub ? -4 : 6));
+    if (sub) {
+      ctx.font = "11px Segoe UI, Malgun Gothic";
+      ctx.fillStyle = "#8ab4c8";
+      ctx.fillText(sub, x + w / 2, y + h / 2 + 14);
+    }
+    ctx.textAlign = "left";
+  }
+
+  function drawSelectScreen() {
+    drawBackground(0);
+    buttons = [];
+
+    ctx.fillStyle = "#00f0ff";
+    ctx.font = "bold 28px Segoe UI, Malgun Gothic";
+    ctx.textAlign = "center";
+    ctx.fillText("사이버 펭귄 러너", W / 2, 72);
+    ctx.font = "14px Segoe UI, Malgun Gothic";
+    ctx.fillStyle = "#8ab4c8";
+    ctx.fillText("캐릭터를 선택하세요", W / 2, 100);
+
+    const cardW = 180;
+    const cardH = 220;
+    const gap = 24;
+    const startX = (W - cardW * 2 - gap) / 2;
+    const cardY = 130;
+
+    ["bbiya", "oru"].forEach((key, i) => {
+      const c = CHARACTERS[key];
+      const x = startX + i * (cardW + gap);
+      const selected = selectedChar === key;
+      ctx.strokeStyle = selected ? c.accent : "#334";
+      ctx.lineWidth = selected ? 3 : 1;
+      ctx.fillStyle = selected ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.3)";
+      ctx.beginPath();
+      ctx.roundRect(x, cardY, cardW, cardH, 12);
+      ctx.fill();
+      ctx.stroke();
+
+      drawCharacterFront(x + cardW / 2, cardY + 100, 118, key, 1);
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 20px Segoe UI, Malgun Gothic";
+      ctx.textAlign = "center";
+      ctx.fillText(c.name, x + cardW / 2, cardY + 168);
+      ctx.font = "11px Segoe UI, Malgun Gothic";
+      ctx.fillStyle = "#8ab4c8";
+      ctx.fillText(c.tagline, x + cardW / 2, cardY + 188);
+
+      buttons.push({
+        id: `char-${key}`,
+        x, y: cardY, w: cardW, h: cardH,
+        action: () => { selectedChar = key; },
+      });
+    });
+
+    const btn = { x: W / 2 - 100, y: H - 100, w: 200, h: 48, label: "Start Game", id: "start" };
+    const hovered = hitRect(pointer.x, pointer.y, btn.x, btn.y, btn.w, btn.h);
+    drawButton(btn, hovered);
+    buttons.push({ ...btn, action: startGame });
+
+    ctx.textAlign = "left";
+  }
+
+  function drawGameOver() {
+    ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ff4466";
+    ctx.font = "bold 36px Segoe UI, Malgun Gothic";
+    ctx.fillText("GAME OVER", W / 2, H / 2 - 40);
+    ctx.fillStyle = "#00f0ff";
+    ctx.font = "bold 22px Segoe UI, Malgun Gothic";
+    ctx.fillText(`최종 점수: ${Math.floor(score)}`, W / 2, H / 2 + 4);
+    ctx.font = "18px Segoe UI, Malgun Gothic";
+    ctx.fillStyle = "#ffd966";
+    ctx.fillText(`최고 점수: ${highScore}`, W / 2, H / 2 + 36);
+    if (newRecord) {
+      ctx.font = "bold 14px Segoe UI, Malgun Gothic";
+      ctx.fillStyle = "#ff6ec7";
+      ctx.fillText("NEW RECORD!", W / 2, H / 2 + 58);
+    }
+
+    const btn = { x: W / 2 - 100, y: H / 2 + (newRecord ? 78 : 62), w: 200, h: 48, label: "Replay", id: "replay" };
+    const hovered = hitRect(pointer.x, pointer.y, btn.x, btn.y, btn.w, btn.h);
+    drawButton(btn, hovered);
+    buttons = [{
+      ...btn,
+      action: () => {
+        state = STATE.SELECT;
+        buttons = [];
+        AudioSys.syncForState(state, STATE);
+      },
+    }];
+    ctx.textAlign = "left";
+  }
+
+  function startGame() {
+    tryUnlockAudio();
+    state = STATE.PLAY;
+    AudioSys.syncForState(state, STATE);
+    lane = 1;
+    lives = 5;
+    score = 0;
+    playTime = 0;
+    entities = [];
+    spawnTimer = 0;
+    invincibleUntil = 0;
+    newRecord = false;
+    playerMotion = { type: MOTION.RUN, until: 0, priority: 0 };
+  }
+
+  function spawnEntity() {
+    const lanePick = Math.floor(Math.random() * 3);
+    const isVaccine = Math.random() < 0.28;
+    entities.push({
+      type: isVaccine ? "vaccine" : "virus",
+      lane: lanePick,
+      z: 0,
+      speed: 0.35 + Math.random() * 0.15,
+    });
+  }
+
+  function tryMoveLane(dir) {
+    if (state !== STATE.PLAY) return;
+    const next = Math.max(0, Math.min(2, lane + dir));
+    if (next === lane) return;
+    lane = next;
+    playPlayerMotion(
+      dir < 0 ? MOTION.TURN_L : MOTION.TURN_R,
+      0.42,
+      MOTION_PRIORITY.turn,
+    );
+  }
+
+  function updatePlay(dt) {
+    playTime += dt;
+    tickPlayerMotion();
+    score += dt * 12;
+
+    spawnTimer += dt;
+    const interval = Math.max(0.55, 1.2 - playTime * 0.02);
+    if (spawnTimer >= interval) {
+      spawnTimer = 0;
+      spawnEntity();
+      if (Math.random() < 0.35) spawnEntity();
+    }
+
+    const py = projectY(PLAYER_Z);
+    const px = laneX(PLAYER_Z, lane);
+    const playerHeight = 72 + (1 - PLAYER_Z) * 28;
+    const invincible = playTime < invincibleUntil;
+    const showingHit = playerMotion.type === MOTION.HIT && playTime < playerMotion.until;
+    const blink = invincible && !showingHit && Math.floor(playTime * 12) % 2 === 0;
+
+    for (let i = entities.length - 1; i >= 0; i--) {
+      const e = entities[i];
+      e.z += e.speed * dt;
+      if (e.z > 1.05) {
+        entities.splice(i, 1);
+        continue;
+      }
+      if (e.z > PLAYER_Z - 0.06 && e.z < PLAYER_Z + 0.06 && e.lane === lane && !e.hit) {
+        e.hit = true;
+        if (e.type === "virus" && !invincible) {
+          lives -= 1;
+          invincibleUntil = playTime + 1.2;
+          playPlayerMotion(MOTION.HIT, 1.2, MOTION_PRIORITY.hit);
+          AudioSys.playHit();
+          if (lives <= 0) {
+            state = STATE.OVER;
+            recordHighScore();
+            AudioSys.syncForState(state, STATE);
+            return;
+          }
+        } else if (e.type === "vaccine") {
+          lives = Math.min(5, lives + 1);
+          score += 50;
+          playPlayerMotion(MOTION.HEAL, 0.9, MOTION_PRIORITY.heal);
+          AudioSys.playHeal();
+        }
+        entities.splice(i, 1);
+      }
+    }
+
+    drawBackground(dt);
+    entities.sort((a, b) => a.z - b.z);
+    for (const e of entities) {
+      const ex = laneX(e.z, e.lane);
+      const ey = projectY(e.z);
+      const sc = 0.4 + e.z * 0.9;
+      if (e.type === "virus") drawVirus(ex, ey, sc);
+      else drawVaccine(ex, ey, sc);
+    }
+
+    if (!blink) {
+      drawCharacterPlay(px, py, playerHeight, selectedChar, 1);
+    }
+    drawHUD();
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+
+    buttons = [];
+    if (state === STATE.SELECT) drawSelectScreen();
+    else if (state === STATE.PLAY) updatePlay(dt);
+    else if (state === STATE.OVER) {
+      updatePlay(0);
+      drawGameOver();
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  canvas.addEventListener("mousemove", (e) => {
+    const r = canvas.getBoundingClientRect();
+    pointer.x = (e.clientX - r.left) * (W / r.width);
+    pointer.y = (e.clientY - r.top) * (H / r.height);
+  });
+
+  canvas.addEventListener("click", (e) => {
+    tryUnlockAudio();
+    const r = canvas.getBoundingClientRect();
+    const x = (e.clientX - r.left) * (W / r.width);
+    const y = (e.clientY - r.top) * (H / r.height);
+    for (const b of buttons) {
+      if (hitRect(x, y, b.x, b.y, b.w, b.h) && b.action) {
+        b.action();
+        break;
+      }
+    }
+  });
+
+  canvas.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    tryUnlockAudio();
+    const t = e.touches[0];
+    const r = canvas.getBoundingClientRect();
+    const x = (t.clientX - r.left) * (W / r.width);
+    const y = (t.clientY - r.top) * (H / r.height);
+    pointer.x = x;
+    pointer.y = y;
+    for (const b of buttons) {
+      if (hitRect(x, y, b.x, b.y, b.w, b.h) && b.action) {
+        b.action();
+        return;
+      }
+    }
+    if (state === STATE.PLAY) {
+      if (x < W / 2) tryMoveLane(-1);
+      else tryMoveLane(1);
+    }
+  }, { passive: false });
+
+  window.addEventListener("keydown", (e) => {
+    tryUnlockAudio();
+    if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") tryMoveLane(-1);
+    if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") tryMoveLane(1);
+    if (e.key === "Enter" && state === STATE.SELECT) startGame();
+  });
+
+  AudioSys.syncForState(STATE.SELECT, STATE);
+  requestAnimationFrame(loop);
+})();
+  </script>
+</body>
+</html>
