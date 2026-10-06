@@ -14,9 +14,30 @@ def remove_white(im: Image.Image, threshold: int = 248) -> Image.Image:
             r, g, b, a = px[x, y]
             if r >= threshold and g >= threshold and b >= threshold:
                 px[x, y] = (r, g, b, 0)
+    return im
+
+
+def remove_top_line_artifacts(im: Image.Image, scan_rows: int = 20) -> Image.Image:
+    """상단 누끼 잔여 흰 줄 제거."""
+    im = im.convert("RGBA")
+    px = im.load()
+    w, h = im.size
+    for y in range(min(scan_rows, h)):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            if a == 0:
+                continue
+            if r >= 230 and g >= 230 and b >= 230:
+                px[x, y] = (0, 0, 0, 0)
     bbox = im.getbbox()
     if bbox:
         im = im.crop(bbox)
+    return im
+
+
+def finalize_sprite(im: Image.Image) -> Image.Image:
+    im = remove_white(im)
+    im = remove_top_line_artifacts(im)
     return im
 
 
@@ -25,7 +46,7 @@ def save_front(src_name: str, out_name: str) -> None:
     if not os.path.isfile(path):
         print("skip missing", src_name)
         return
-    im = remove_white(Image.open(path))
+    im = finalize_sprite(Image.open(path))
     im.save(os.path.join(BASE, out_name), "PNG")
     print(out_name, im.size)
 
@@ -46,7 +67,7 @@ def split_motion(src_name: str, prefix: str) -> None:
     }
     for key, (x, y) in cells.items():
         cell = sheet.crop((x, y, x + cw, y + ch))
-        cell = remove_white(cell)
+        cell = finalize_sprite(cell)
         out = os.path.join(BASE, f"{prefix}_{key}.png")
         cell.save(out, "PNG")
         print(out, cell.size)
